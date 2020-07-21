@@ -4,12 +4,12 @@ set -ex
 # build-manifests is designed to populate the deploy directory
 # with all of the manifests necessary for use in development
 # and for consumption with the operator-lifecycle-manager.
-# 
+#
 # First, we create a temporary directory and filling it with
 # all of the component operator's ClusterServiceVersion (CSV for OLM)
 # and CustomResourceDefinitions (CRDs); being sure to copy the CRDs
 # into the deploy/crds directory.
-# 
+#
 # The CSV manifests contain all of the information we need to 1) generate
 # a combined CSV and 2) other development related manifests (like the
 # operator deployment + rbac).
@@ -63,19 +63,26 @@ function gen_csv() {
   local csvWithCRDs="${operatorName}.${CSV_CRD_EXT}"
   local crds="${operatorName}.crds.yaml"
 
-  # TODO: Use oc to run if cluster is available
-  local dockerArgs="docker run --rm --entrypoint=/usr/bin/csv-generator ${imagePullUrl} ${operatorArgs}"
-
-  eval $dockerArgs > $csv
-  eval $dockerArgs $dumpCRDsArg > $csvWithCRDs
+  # Setting CSV_GEN_IN_CLUSTER will generate the CSVs in an OCP cluster
+  # (requires oc binary)
+  if [[ -n ${CSV_GEN_IN_CLUSTER} ]]; then
+      csv_gen_pod=${operatorName}-csv-gen
+      oc run ${csv_gen_pod} -i --quiet=true --serviceaccount='jenkins' --image=${imagePullUrl} --restart=Never --command -- /usr/bin/csv-generator ${operatorArgs} > ${csv}
+      oc delete pod --ignore-not-found ${csv_gen_pod} >&2
+      oc run ${csv_gen_pod} -i --quiet=true --serviceaccount='jenkins' --image=${imagePullUrl} --restart=Never --command -- /usr/bin/csv-generator ${operatorArgs} ${dumpCRDsArg} > ${csvWithCRDs}
+      oc delete pod --ignore-not-found ${csv_gen_pod} >&2
+  else
+      docker run --rm --entrypoint=/usr/bin/csv-generator ${imagePullUrl} ${operatorArgs} > ${csv}
+      docker run --rm --entrypoint=/usr/bin/csv-generator ${imagePullUrl} ${operatorArgs} ${dumpCRDsArg} > ${csvWithCRDs}
+  fi
 
   diff -u $csv $csvWithCRDs | grep -E "^\+" | sed -E 's/^\+//' | tail -n+2 > $crds
 
   csplit --digits=2 --quiet --elide-empty-files \
-    --prefix="${operatorName}" \
-    --suffix-format="%02d.${CRD_EXT}" \
-    $crds \
-    "/---/" "{*}"
+      --prefix="${operatorName}" \
+      --suffix-format="%02d.${CRD_EXT}" \
+      $crds \
+      "/---/" "{*}"
 }
 
 function create_virt_csv() {
@@ -227,9 +234,14 @@ spec:
 EOM
 
 # Write HCO CRDs
-(cd ${PROJECT_ROOT}/tools/csv-merger/ && go build)
+if [[ -z ${CSV_MERGER_BIN} ]]; then
+    (cd ${PROJECT_ROOT}/tools/csv-merger/ && go build)
+    CSV_MERGER_BIN=${PROJECT_ROOT}/tools/csv-merger/csv-merger
+    CLEAN_CSV_MERGER=1
+fi
+
 hco_crds=${TEMPDIR}/hco.crds.yaml
-${PROJECT_ROOT}/tools/csv-merger/csv-merger --output-mode=CRDs > $hco_crds
+(cd ${PROJECT_ROOT}; ${CSV_MERGER_BIN} --output-mode=CRDs > $hco_crds)
 csplit --digits=2 --quiet --elide-empty-files \
   --prefix=hco \
   --suffix-format="%02d.${CRD_EXT}" \
@@ -249,8 +261,13 @@ EOM
 )
 
 # Build and write deploy dir
-(cd ${PROJECT_ROOT}/tools/manifest-templator/ && go build)
-${PROJECT_ROOT}/tools/manifest-templator/manifest-templator \
+if [[ -z ${MANIFEST_TEMPLATOR_BIN} ]]; then
+    (cd ${PROJECT_ROOT}/tools/manifest-templator/ && go build)
+    MANIFEST_TEMPLATOR_BIN=${PROJECT_ROOT}/tools/manifest-templator/manifest-templator
+    CLEAN_MANIFEST_TEMPLATOR=1
+fi
+
+${MANIFEST_TEMPLATOR_BIN} \
   --cna-csv="$(<${cnaCsv})" \
   --virt-csv="$(<${virtCsv})" \
   --ssp-csv="$(<${sspCsv})" \
@@ -271,10 +288,12 @@ ${PROJECT_ROOT}/tools/manifest-templator/manifest-templator \
   --hppo-version="${HPPO_VERSION}" \
   --vm-import-version="${VM_IMPORT_VERSION}" \
   --operator-image="${OPERATOR_IMAGE}"
-(cd ${PROJECT_ROOT}/tools/manifest-templator/ && go clean)
+if [[ -n ${CLEAN_MANIFEST_TEMPLATOR} ]]; then
+    (cd ${PROJECT_ROOT}/tools/manifest-templator/ && go clean)
+fi
 
 # Build and merge CSVs
-${PROJECT_ROOT}/tools/csv-merger/csv-merger \
+${CSV_MERGER_BIN} \
   --cna-csv="$(<${cnaCsv})" \
   --virt-csv="$(<${virtCsv})" \
   --ssp-csv="$(<${sspCsv})" \
@@ -307,8 +326,10 @@ cp -f ${TEMPDIR}/*.${CRD_EXT} ${CRD_DIR}
 cp -f ${TEMPDIR}/*.${CRD_EXT} ${CSV_DIR}
 
 # Check there are not API Groups overlap between different CNV operators
-${PROJECT_ROOT}/tools/csv-merger/csv-merger --crds-dir=${CRD_DIR}
-(cd ${PROJECT_ROOT}/tools/csv-merger/ && go clean)
+${CSV_MERGER_BIN} --crds-dir=${CRD_DIR}
+if [[ -n ${CLEAN_CSV_MERGER} ]]; then
+    (cd ${PROJECT_ROOT}/tools/csv-merger/ && go clean)
+fi
 
 # Intentionally removing last so failure leaves around the templates
 rm -rf ${TEMPDIR}

@@ -105,6 +105,11 @@ upgrade-test:
 kubevirt-nightly-test:
 	./hack/kubevirt-nightly-test.sh
 
+nightly-vendor:
+	./hack/nightly-update.sh vendor
+
+nightly-build: nightly-vendor build
+
 dump-state:
 	./hack/dump-state.sh 
 
